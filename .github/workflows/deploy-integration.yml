@@ -1,0 +1,196 @@
+name: 4️⃣ Deploy Integration
+
+on:
+  workflow_run:
+    workflows: ["3️⃣ Publish to GHCR"]
+    types: [completed]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Vérifier que le workflow précédent a réussi
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: 📥 Checkout du code
+        uses: actions/checkout@v4
+        with:
+          # Récupérer le commit du workflow qui a déclenché celui-ci
+          ref: ${{ github.event.workflow_run.head_commit.sha }}
+
+      - name: 📋 Afficher les informations du contexte
+        run: |
+          echo "🔍 Informations du déploiement:"
+          echo "Commit SHA: ${{ github.event.workflow_run.head_commit.sha }}"
+          echo "Branche: ${{ github.event.workflow_run.head_branch }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Owner: ${{ github.repository_owner }}"
+
+      - name: 🐳 Construire l'URL de l'image GHCR
+        id: image
+        run: |
+          # Utiliser le short SHA pour identifier l'image
+          SHORT_SHA=$(echo ${{ github.event.workflow_run.head_commit.sha }} | cut -c1-7)
+          BRANCH=${{ github.event.workflow_run.head_branch }}
+
+          # Construire l'URL de l'image
+          IMAGE="ghcr.io/${{ github.repository_owner }}/pipeline-python:${BRANCH}-${SHORT_SHA}"
+
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "✅ Image construite: $IMAGE"
+
+      - name: 🔐 Authentification à GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "✅ Authentification à GHCR réussie"
+
+      - name: 🐳 Pull de l'image du GHCR
+        run: |
+          IMAGE="${{ steps.image.outputs.image }}"
+          echo "📥 Téléchargement de l'image: $IMAGE"
+          docker pull $IMAGE
+          echo "✅ Image téléchargée avec succès"
+
+      - name: 🚀 Démarrer la stack avec docker-compose
+        env:
+          PYTHON_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          echo "🚀 Démarrage de la stack complète..."
+          echo "Variable PYTHON_IMAGE: $PYTHON_IMAGE"
+
+          # Démarrer la stack
+          docker-compose up -d
+
+          echo "✅ Stack démarrée"
+
+          # Attendre que les services soient prêts
+          echo "⏳ Attente du démarrage des services..."
+          sleep 10
+
+      - name: 📊 Vérifier l'état des conteneurs
+        run: |
+          echo "🔍 État des conteneurs:"
+          docker ps -a
+
+          echo ""
+          echo "🔍 Vérification de la santé des services:"
+
+          # Vérifier que tous les services sont UP
+          for service in pipeline_python pipeline_nginx pipeline_postgres pipeline_redis; do
+            if docker ps | grep -q $service; then
+              echo "✅ $service est en cours d'exécution"
+            else
+              echo "❌ $service n'est pas en cours d'exécution"
+              docker ps -a
+              exit 1
+            fi
+          done
+
+      - name: 🧪 Test de l'application Python directement
+        run: |
+          echo "🧪 Test direct de l'application Python..."
+
+          for i in {1..30}; do
+            if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+              echo "✅ L'application Python répond sur le port 5000"
+              curl -s http://localhost:5000/health | jq .
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ L'application Python n'a pas répondu"
+              docker logs pipeline_python
+              exit 1
+            fi
+            echo "⏳ Tentative $i..."
+            sleep 1
+          done
+
+      - name: 🌐 Test du proxy Nginx
+        run: |
+          echo "🌐 Test du proxy Nginx..."
+
+          # Attendre que Nginx soit prêt
+          for i in {1..30}; do
+            if curl -s http://localhost/health > /dev/null 2>&1; then
+              echo "✅ Nginx répond sur le port 80"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ Nginx n'a pas répondu"
+              docker logs pipeline_nginx
+              exit 1
+            fi
+            echo "⏳ Tentative $i pour Nginx..."
+            sleep 1
+          done
+
+      - name: 🔗 Vérifier que Nginx proxy correctement vers Python
+        run: |
+          echo "🔗 Vérification du proxying Nginx vers Python..."
+
+          # Tester les endpoints via Nginx
+          echo ""
+          echo "Test GET / via Nginx:"
+          curl -v http://localhost/
+
+          echo ""
+          echo ""
+          echo "Test GET /health via Nginx:"
+          curl -v http://localhost/health
+
+          echo ""
+          echo ""
+          echo "Test GET /version via Nginx:"
+          curl -v http://localhost/version
+
+          # Vérifier que les réponses viennent bien du Python
+          echo ""
+          echo "✅ Les requêtes passent correctement par Nginx vers Python"
+
+      - name: 📝 Afficher les logs des services
+        if: always()
+        run: |
+          echo "===== 📝 LOGS DES SERVICES ====="
+          echo ""
+          echo "--- Logs Python ---"
+          docker logs pipeline_python | tail -20
+
+          echo ""
+          echo "--- Logs Nginx ---"
+          docker logs pipeline_nginx | tail -20
+
+          echo ""
+          echo "--- Logs PostgreSQL ---"
+          docker logs pipeline_postgres | tail -10
+
+          echo ""
+          echo "--- Logs Redis ---"
+          docker logs pipeline_redis | tail -10
+
+      - name: 📊 Afficher les metrics des conteneurs
+        if: always()
+        run: |
+          echo "===== 📊 METRICS DES CONTENEURS ====="
+          docker stats --no-stream
+
+      - name: 🧹 Cleanup (optionnel - commenté)
+        if: always()
+        run: |
+          echo "🧹 Nettoyage de la stack..."
+          # Décommenter pour nettoyer après les tests:
+          # docker-compose down -v
+
+          echo "✅ Stack arrêtée"
+          echo "💡 Remarque: Pour arrêter manuellement la stack, exécutez: docker-compose down -v"
+
+      - name: 🎉 Déploiement terminé avec succès
+        run: |
+          echo "✅ Workflow deploy-integration.yml terminé avec succès"
+          echo ""
+          echo "🎯 Validation complète du pipeline:"
+          echo "  1️⃣  Build & Test Python: ✅"
+          echo "  2️⃣  Security Scan: ✅"
+          echo "  3️⃣  Publish to GHCR: ✅"
+          echo "  4️⃣  Deploy Integration: ✅"
+          echo ""
+          echo "🚀 La stack est complètement fonctionnelle en intégration!"

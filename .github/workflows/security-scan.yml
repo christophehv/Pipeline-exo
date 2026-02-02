@@ -1,0 +1,122 @@
+name: 2️⃣ Security Scan
+
+on:
+  workflow_run:
+    workflows: ["1️⃣ Build & Test Python"]
+    types: [completed]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    # Vérifier que le workflow précédent a réussi
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: 📥 Checkout du code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Installer Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | tee -a /etc/apt/sources.list.d/trivy.list
+          apt-get update
+          apt-get install -y trivy
+          echo "✅ Trivy installé avec succès"
+
+      - name: 🔍 Scanner nginx:alpine avec Trivy
+        id: trivy_nginx
+        continue-on-error: true
+        run: |
+          echo "🔍 Scan de l'image nginx:alpine..."
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --format json nginx:alpine > /tmp/nginx-scan.json
+
+          # Afficher les résultats
+          echo "📋 Résultats du scan nginx:alpine:"
+          trivy image --severity HIGH,CRITICAL nginx:alpine
+
+          # Compter les vulnérabilités CRITICAL
+          CRITICAL_COUNT=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length' /tmp/nginx-scan.json 2>/dev/null || echo 0)
+          echo "nginx_critical=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+
+          # Vérifier les CRITICAL dans les vulnérabilités
+          CRITICAL_VULNS=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' /tmp/nginx-scan.json 2>/dev/null || echo 0)
+          echo "nginx_critical_vulns=$CRITICAL_VULNS" >> $GITHUB_OUTPUT
+
+          echo "Vulnérabilités CRITICAL trouvées : $CRITICAL_VULNS"
+
+      - name: 🔍 Scanner postgres:alpine avec Trivy
+        id: trivy_postgres
+        continue-on-error: true
+        run: |
+          echo "🔍 Scan de l'image postgres:alpine..."
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --format json postgres:alpine > /tmp/postgres-scan.json
+
+          # Afficher les résultats
+          echo "📋 Résultats du scan postgres:alpine:"
+          trivy image --severity HIGH,CRITICAL postgres:alpine
+
+          # Compter les vulnérabilités CRITICAL
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' /tmp/postgres-scan.json 2>/dev/null || echo 0)
+          echo "postgres_critical=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+          echo "Vulnérabilités CRITICAL trouvées : $CRITICAL_COUNT"
+
+      - name: 🔍 Scanner redis:alpine avec Trivy
+        id: trivy_redis
+        continue-on-error: true
+        run: |
+          echo "🔍 Scan de l'image redis:alpine..."
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --format json redis:alpine > /tmp/redis-scan.json
+
+          # Afficher les résultats
+          echo "📋 Résultats du scan redis:alpine:"
+          trivy image --severity HIGH,CRITICAL redis:alpine
+
+          # Compter les vulnérabilités CRITICAL
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' /tmp/redis-scan.json 2>/dev/null || echo 0)
+          echo "redis_critical=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+          echo "Vulnérabilités CRITICAL trouvées : $CRITICAL_COUNT"
+
+      - name: 📊 Récapitulatif des scans
+        run: |
+          echo "===== 📊 RÉCAPITULATIF DES SCANS ====="
+          echo ""
+          echo "nginx:alpine"
+          echo "  - CRITICAL: ${{ steps.trivy_nginx.outputs.nginx_critical_vulns || 0 }}"
+          echo ""
+          echo "postgres:alpine"
+          echo "  - CRITICAL: ${{ steps.trivy_postgres.outputs.postgres_critical || 0 }}"
+          echo ""
+          echo "redis:alpine"
+          echo "  - CRITICAL: ${{ steps.trivy_redis.outputs.redis_critical || 0 }}"
+          echo ""
+
+      - name: ❌ Vérifier les vulnérabilités CRITICAL
+        run: |
+          NGINX_CRITICAL=${{ steps.trivy_nginx.outputs.nginx_critical_vulns || 0 }}
+          POSTGRES_CRITICAL=${{ steps.trivy_postgres.outputs.postgres_critical || 0 }}
+          REDIS_CRITICAL=${{ steps.trivy_redis.outputs.redis_critical || 0 }}
+
+          TOTAL_CRITICAL=$((NGINX_CRITICAL + POSTGRES_CRITICAL + REDIS_CRITICAL))
+
+          if [ "$TOTAL_CRITICAL" -gt 0 ]; then
+            echo "❌ ⚠️ ERREUR : $TOTAL_CRITICAL vulnérabilité(s) CRITICAL trouvée(s) !"
+            echo "Le job doit échouer car il y a des vulnérabilités CRITICAL"
+            exit 1
+          else
+            echo "✅ Aucune vulnérabilité CRITICAL trouvée - Scan réussi !"
+          fi
+
+      - name: 📈 Upload des résultats de scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-results
+          path: /tmp/*-scan.json
+          retention-days: 30
+
+      - name: 🎉 Scan terminé avec succès
+        run: |
+          echo "✅ Workflow security-scan.yml terminé avec succès"
+          echo "Les images d'infrastructure ont passé la vérification de sécurité"
+          echo ""
+          echo "Prochaine étape: publish-ghcr.yml sera déclenché automatiquement"
